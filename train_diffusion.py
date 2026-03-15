@@ -74,13 +74,21 @@ EMB_DIM = 32  # embedding dimension for each byte token
 
 # Unet1D architecture
 UNET_DIM = 64  # base channel dimension
-UNET_DIM_MULTS = (1, 2, 4)  # channel multipliers (3 levels)
+UNET_DIM_MULTS = (1, 2, 4)  # channel multipliers for each resolution level
+UNET_INIT_DIM = None  # initial conv channels (None = same as UNET_DIM)
+UNET_DROPOUT = 0.0  # dropout in ResNet blocks (try 0.1 if overfitting)
+SELF_CONDITION = False  # self-conditioning: feed previous prediction back as input
+LEARNED_SINUSOIDAL = False  # use learned sinusoidal timestep embeddings
+LEARNED_SINUSOIDAL_DIM = 16  # dimension for learned sinusoidal embeddings
+ATTN_DIM_HEAD = 32  # dimension per attention head in bottleneck
+ATTN_HEADS = 4  # number of attention heads in bottleneck
 
 # Diffusion process
 TIMESTEPS = 1000  # diffusion timesteps (T)
 SAMPLING_TIMESTEPS = 50  # DDIM sampling steps (for fast generation)
 OBJECTIVE = "pred_v"  # 'pred_noise', 'pred_x0', 'pred_v'
 BETA_SCHEDULE = "cosine"  # 'linear' or 'cosine'
+DDIM_SAMPLING_ETA = 0.0  # DDIM stochasticity: 0=deterministic, 1=DDPM-equivalent
 
 # Optimization
 LEARNING_RATE = 1e-4
@@ -230,11 +238,15 @@ def build_model():
     """Build the byte-embedding diffusion model."""
     unet = Unet1D(
         dim=UNET_DIM,
+        init_dim=UNET_INIT_DIM,
         dim_mults=UNET_DIM_MULTS,
-        channels=EMB_DIM,  # input channels = embedding dim
-        self_condition=False,
-        learned_sinusoidal_cond=False,
-        random_fourier_features=False,
+        channels=EMB_DIM,
+        dropout=UNET_DROPOUT,
+        self_condition=SELF_CONDITION,
+        learned_sinusoidal_cond=LEARNED_SINUSOIDAL,
+        learned_sinusoidal_dim=LEARNED_SINUSOIDAL_DIM,
+        attn_dim_head=ATTN_DIM_HEAD,
+        attn_heads=ATTN_HEADS,
     )
 
     diffusion = GaussianDiffusion1D(
@@ -244,7 +256,8 @@ def build_model():
         sampling_timesteps=SAMPLING_TIMESTEPS,
         objective=OBJECTIVE,
         beta_schedule=BETA_SCHEDULE,
-        auto_normalize=True,  # normalize input to [-1, 1]
+        ddim_sampling_eta=DDIM_SAMPLING_ETA,
+        auto_normalize=True,
         channel_first=True,
     )
 
@@ -360,7 +373,8 @@ def main():
     # Model
     print(
         f"Building model: unet_dim={UNET_DIM}, dim_mults={UNET_DIM_MULTS}, "
-        f"emb_dim={EMB_DIM}, seq_len={SEQ_LEN}, T={TIMESTEPS}, obj={OBJECTIVE}"
+        f"emb_dim={EMB_DIM}, seq_len={SEQ_LEN}, T={TIMESTEPS}, obj={OBJECTIVE}, "
+        f"self_cond={SELF_CONDITION}, dropout={UNET_DROPOUT}"
     )
     model = build_model()
     model.cuda()
@@ -510,10 +524,17 @@ def main():
     print(f"num_steps:        {step}")
     print(f"num_params_M:     {num_params / 1e6:.1f}")
     print(f"seq_len:          {SEQ_LEN}")
-    print(f"unet_dim:         {UNET_DIM}")
     print(f"emb_dim:          {EMB_DIM}")
+    print(f"unet_dim:         {UNET_DIM}")
+    print(f"dim_mults:        {UNET_DIM_MULTS}")
+    print(f"batch_size:       {BATCH_SIZE}")
+    print(f"grad_accum:       {GRADIENT_ACCUMULATE_EVERY}")
+    print(f"lr:               {LEARNING_RATE}")
     print(f"timesteps:        {TIMESTEPS}")
     print(f"objective:        {OBJECTIVE}")
+    print(f"beta_schedule:    {BETA_SCHEDULE}")
+    print(f"self_condition:   {SELF_CONDITION}")
+    print(f"dropout:          {UNET_DROPOUT}")
     print(f"precision:        {precision_tag}")
 
 

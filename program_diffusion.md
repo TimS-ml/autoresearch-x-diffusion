@@ -64,19 +64,26 @@ is better than a small improvement that adds complexity.
 
 ```
 ---
-val_loss:         0.123456
-val_bpd:          0.178012
-training_seconds: 300.1
-total_seconds:    325.9
-peak_vram_mb:     4096.0
-total_tokens_M:   180.0
-num_steps:        1500
-num_params_M:     5.2
+val_loss:         0.009394
+val_bpd:          0.013552
+training_seconds: 300.0
+total_seconds:    342.0
+peak_vram_mb:     227.8
+total_tokens_M:   81.2
+num_steps:        9909
+num_params_M:     4.6
 seq_len:          128
-unet_dim:         64
 emb_dim:          32
+unet_dim:         64
+dim_mults:        (1, 2, 4)
+batch_size:       64
+grad_accum:       1
+lr:               0.0001
 timesteps:        1000
 objective:        pred_v
+beta_schedule:    cosine
+self_condition:   False
+dropout:          0.0
 precision:        BF16
 ```
 
