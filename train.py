@@ -1,20 +1,27 @@
 """
-Autoresearch pretraining script using x-transformers.
+Autoresearch training script using x-DDPM (denoising diffusion, 1D).
 Single-GPU, single-file, time-budgeted training on enwik8.
 
 Hardware: Any NVIDIA GPU with >= 8 GB VRAM (tested on RTX 4090).
-          FP8 supported on Ada Lovelace / Hopper / Blackwell (SM89+).
-Precision: BF16 (default), FP8 via torchao (optional), FP16 (optional)
-Optimizer: MuonAdamAtan2 (Muon for matrix params, AdamAtan2 for rest)
+Precision: BF16 (default)
+
+Design:
+    Bytes (0-255) are embedded into continuous 32-dim vectors via a learned embedding.
+    The Unet1D operates on (batch, EMB_DIM, SEQ_LEN) shaped tensors.
+    GaussianDiffusion1D handles the forward/reverse process.
+    Metric: val_loss (MSE denoising loss, lower is better).
+    Secondary: val_bpd = val_loss / ln(2)  (bits per dim, for rough comparison).
+    Note: bpd here is NOT the same as autoregressive BPC — it is the denoising loss
+    converted to bits. Lower is better in both cases.
 
 Usage:
-    python train.py                      # BF16 (default, always works)
-    USE_FP8=1 python train.py            # FP8 via torchao (SM89+)
-    USE_FP16=1 python train.py           # FP16 instead of BF16
+    python train.py           # BF16 (default)
+    USE_FP16=1 python train.py
 
 References:
-    - x-transformers: https://github.com/lucidrains/x-transformers
+    - x-DDPM: https://github.com/lucidrains/denoising-diffusion-pytorch
     - See docs/adjustable_params.md for full parameter reference
+    - See docs/design.md for design decisions
 """
 
 import os
@@ -30,98 +37,96 @@ import random
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 # ---------------------------------------------------------------------------
-# x-transformers (from local ./x-transformers submodule)
+# x-DDPM (from local ./x-DDPM submodule)
 # ---------------------------------------------------------------------------
 
-sys.path.insert(
-    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "x-transformers")
-)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "x-DDPM"))
 
-from x_transformers import TransformerWrapper, Decoder
-from x_transformers.autoregressive_wrapper import AutoregressiveWrapper
+from denoising_diffusion_pytorch import Unet1D, GaussianDiffusion1D
 
 # ---------------------------------------------------------------------------
-# Precision selection: FP8 (torchao), FP16, or BF16 (default)
+# Precision selection: FP16 or BF16 (default)
 # ---------------------------------------------------------------------------
 
-USE_FP8 = os.environ.get("USE_FP8", "0") == "1"
 USE_FP16 = os.environ.get("USE_FP16", "0") == "1"
-fp8_available = False
-
-if USE_FP8:
-    try:
-        from torchao.float8 import Float8LinearConfig, convert_to_float8_training
-
-        fp8_available = True
-        print("FP8: torchao float8 training loaded successfully")
-    except ImportError:
-        print("FP8: torchao not installed, falling back to BF16")
-        print("  Install with: pip install torchao")
-        USE_FP8 = False
-
-# ---------------------------------------------------------------------------
-# Optimizer (MuonAdamAtan2 or fallback to AdamW)
-# ---------------------------------------------------------------------------
-
-try:
-    from adam_atan2_pytorch import MuonAdamAtan2
-
-    HAS_MUON = True
-except ImportError:
-    print("Warning: adam-atan2-pytorch not installed, falling back to AdamW")
-    print("  Install with: pip install adam-atan2-pytorch")
-    HAS_MUON = False
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 4096  # context length for enwik8 training
 TIME_BUDGET = 300  # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 5_000_000  # validation set size (5M bytes)
 
 # ---------------------------------------------------------------------------
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
 
-# Model architecture (x-transformers Decoder)
-MODEL_DIM = 448  # hidden dimension
-MODEL_DEPTH = 6  # number of transformer layers
-MODEL_HEADS = 7  # number of attention heads
-VOCAB_SIZE = 256  # byte-level (char-level), one token per byte value
+# Data
+SEQ_LEN = 128  # bytes per sample (sequence length for diffusion)
+VOCAB_SIZE = 256  # byte-level vocabulary
+
+# Embedding: continuous representation of discrete bytes
+EMB_DIM = 32  # embedding dimension for each byte token
+
+# Unet1D architecture
+UNET_DIM = 64  # base channel dimension
+UNET_DIM_MULTS = (1, 2, 4)  # channel multipliers for each resolution level
+UNET_INIT_DIM = None  # initial conv channels (None = same as UNET_DIM)
+UNET_DROPOUT = 0.0  # dropout in ResNet blocks (try 0.1 if overfitting)
+SELF_CONDITION = False  # self-conditioning: feed previous prediction back as input
+LEARNED_SINUSOIDAL = False  # use learned sinusoidal timestep embeddings
+LEARNED_SINUSOIDAL_DIM = 16  # dimension for learned sinusoidal embeddings
+ATTN_DIM_HEAD = 32  # dimension per attention head in bottleneck
+ATTN_HEADS = 4  # number of attention heads in bottleneck
+
+# Diffusion process
+TIMESTEPS = 1000  # diffusion timesteps (T)
+SAMPLING_TIMESTEPS = 50  # DDIM sampling steps (for fast generation)
+OBJECTIVE = "pred_v"  # 'pred_noise', 'pred_x0', 'pred_v'
+BETA_SCHEDULE = "cosine"  # 'linear' or 'cosine'
+DDIM_SAMPLING_ETA = 0.0  # DDIM stochasticity: 0=deterministic, 1=DDPM-equivalent
 
 # Optimization
-LEARNING_RATE = 1.1e-2  # slightly above 1e-2 with clip=0.8
-BATCH_SIZE = 24  # per-device micro-batch size
-GRADIENT_ACCUMULATE_EVERY = 1  # gradient accumulation steps
-WEIGHT_DECAY = 0.1  # AdamW weight decay
-GRAD_CLIP = 0.8  # gradient norm clipping (between 0.5 and 1.0)
-
-# LR Schedule (time-based)
-WARMUP_RATIO = 0.05  # fraction of time budget for LR warmup
-WARMDOWN_RATIO = 0.47  # fine-tuning between 0.45 and 0.5
-FINAL_LR_FRAC = 0.02  # final LR as fraction of initial
+LEARNING_RATE = 1e-4
+BATCH_SIZE = 64
+GRADIENT_ACCUMULATE_EVERY = 1
+WEIGHT_DECAY = 1e-4
+GRAD_CLIP = 1.0
 
 # Logging
 VALIDATE_EVERY = 100  # validation frequency (in steps)
-GENERATE_EVERY = 500  # text generation frequency (in steps)
-GENERATE_LENGTH = 512  # tokens to generate for qualitative eval
+GENERATE_EVERY = 500  # generation frequency (in steps)
+NUM_EVAL_BATCHES = 50  # batches for validation
 
 # GPU performance reference for MFU estimation
-# RTX 4090 BF16 peak: ~330 TFLOPS (adjust for your GPU)
-GPU_BF16_PEAK_FLOPS = 330e12
+GPU_BF16_PEAK_FLOPS = 330e12  # RTX 4090
 
 # ---------------------------------------------------------------------------
 # Data: enwik8 (character-level)
 # ---------------------------------------------------------------------------
 
-DATA_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "x-transformers", "data", "enwik8.gz"
-)
+
+def _find_enwik8():
+    """Search for enwik8.gz in several candidate locations."""
+    base = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(base, "x-transformers", "data", "enwik8.gz"),
+        os.path.join(base, "..", "x-transformers", "data", "enwik8.gz"),
+        os.path.join(base, "..", "..", "x-transformers", "data", "enwik8.gz"),
+        os.path.expanduser("~/offline-git/RAG/x-transformers/data/enwik8.gz"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return os.path.abspath(p)
+    # Fallback: original path (will raise a clear error)
+    return candidates[0]
+
+
+DATA_PATH = _find_enwik8()
 
 
 def load_enwik8(data_path=DATA_PATH):
@@ -132,8 +137,8 @@ def load_enwik8(data_path=DATA_PATH):
         return torch.from_numpy(train_x), torch.from_numpy(valid_x)
 
 
-class TextSamplerDataset(Dataset):
-    """Random subsequence sampler from a byte tensor."""
+class ByteSequenceDataset(Dataset):
+    """Random subsequence sampler from a byte tensor — returns byte token IDs."""
 
     def __init__(self, data, seq_len):
         super().__init__()
@@ -141,9 +146,9 @@ class TextSamplerDataset(Dataset):
         self.seq_len = seq_len
 
     def __getitem__(self, index):
-        rand_start = torch.randint(0, self.data.size(0) - self.seq_len - 1, (1,))
-        full_seq = self.data[rand_start : rand_start + self.seq_len + 1].long()
-        return full_seq.cuda()
+        rand_start = torch.randint(0, self.data.size(0) - self.seq_len, (1,))
+        seq = self.data[rand_start : rand_start + self.seq_len].long()
+        return seq.cuda()
 
     def __len__(self):
         return self.data.size(0) // self.seq_len
@@ -165,69 +170,104 @@ def decode_tokens(tokens):
 
 
 # ---------------------------------------------------------------------------
-# Evaluation: Bits Per Character (BPC)
-# ---------------------------------------------------------------------------
-
-
-@torch.no_grad()
-def evaluate_bpc(ar_model, val_loader, num_eval_batches=50):
-    """
-    Compute bits per character (BPC) on validation set.
-    BPC = cross_entropy_loss / ln(2)
-    For char-level models, BPC ≡ BPB (bits per byte).
-    """
-    ar_model.eval()
-    total_loss = 0.0
-    total_tokens = 0
-
-    for _ in range(num_eval_batches):
-        data = next(val_loader)
-        # AutoregressiveWrapper splits into x[:, :-1] and targets[:, 1:]
-        loss = ar_model(data)
-        batch_tokens = data.size(0) * (data.size(1) - 1)
-        total_loss += loss.item() * batch_tokens
-        total_tokens += batch_tokens
-
-    avg_loss = total_loss / total_tokens
-    bpc = avg_loss / math.log(2)
-    return bpc
-
-
-# ---------------------------------------------------------------------------
 # Model construction
 # ---------------------------------------------------------------------------
 
 
+class ByteEmbeddingDiffusion(nn.Module):
+    """
+    Wrapper that embeds discrete bytes into continuous space for diffusion.
+
+    Forward:
+        bytes (B, L) -> embed -> (B, EMB_DIM, L) -> diffuse -> denoising loss
+
+    The embedding projects discrete byte tokens into a continuous EMB_DIM-dim space
+    where the Unet1D can operate. We normalize embeddings to unit sphere to keep
+    the scale compatible with the [-1,1] range expected by GaussianDiffusion1D
+    (auto_normalize=False since we handle normalization ourselves).
+    """
+
+    def __init__(self, vocab_size, emb_dim, unet, diffusion):
+        super().__init__()
+        self.emb = nn.Embedding(vocab_size, emb_dim)
+        # Initialize embeddings to unit sphere (helps diffusion stay in-distribution)
+        nn.init.normal_(self.emb.weight, 0.0, 0.1)
+        self.unet = unet
+        self.diffusion = diffusion
+
+    def embed(self, byte_seq):
+        """
+        Embed byte tokens to continuous space.
+        byte_seq: (B, L) long
+        returns: (B, EMB_DIM, L) float  (channel-first for Unet1D)
+        """
+        x = self.emb(byte_seq)  # (B, L, EMB_DIM)
+        x = x.transpose(1, 2)  # (B, EMB_DIM, L)
+        return x
+
+    def forward(self, byte_seq):
+        """
+        Compute diffusion denoising loss on a batch of byte sequences.
+        byte_seq: (B, L) long
+        returns: scalar loss
+        """
+        x = self.embed(byte_seq)  # (B, EMB_DIM, L) in [-~1, ~1]
+        loss = self.diffusion(x)
+        return loss
+
+    @torch.no_grad()
+    def sample(self, batch_size=4):
+        """Sample sequences: runs reverse diffusion then finds nearest embedding."""
+        # Sample in embedding space
+        x = self.diffusion.sample(batch_size=batch_size)  # (B, EMB_DIM, L)
+        x = x.transpose(1, 2)  # (B, L, EMB_DIM)
+
+        # Nearest-neighbor decode: find closest embedding vector for each position
+        W = self.emb.weight  # (vocab_size, emb_dim)
+        B, L, D = x.shape
+        x_flat = x.reshape(B * L, D)  # (B*L, D)
+        # Cosine similarity for nearest neighbor
+        x_norm = F.normalize(x_flat, dim=-1)
+        W_norm = F.normalize(W, dim=-1)
+        sim = x_norm @ W_norm.T  # (B*L, vocab_size)
+        token_ids = sim.argmax(dim=-1).reshape(B, L)  # (B, L)
+        return token_ids
+
+
 def build_model():
-    """Build x-transformers decoder model wrapped for autoregressive training."""
-    model = TransformerWrapper(
-        num_tokens=VOCAB_SIZE,
-        max_seq_len=MAX_SEQ_LEN,
-        post_emb_norm=True,  # LayerNorm after embeddings (BLOOM/YaLM-style)
-        emb_frac_gradient=0.1,  # GLM-130B: reduce embedding gradient flow
-        attn_layers=Decoder(
-            dim=MODEL_DIM,
-            depth=MODEL_DEPTH,
-            heads=MODEL_HEADS,
-            rotary_pos_emb=True,  # RoPE (standard for modern transformers)
-            rotary_xpos=True,  # xPos: position-dependent scaling for long context
-            attn_flash=True,  # PyTorch SDP flash attention
-            attn_qk_norm=True,  # QK normalization for training stability
-            attn_laser=True,  # LASER: gradient enhancement via exponentiated values
-            ff_glu=True,  # Gated Linear Unit
-            ff_swish=True,  # SwiGLU activation (PaLM/LLaMA-style)
-            ff_glu_mult_bias=True,  # learnable bias in GLU gate
-            use_rmsnorm=True,  # RMSNorm instead of LayerNorm
-            add_value_residual=True,  # ResFormer value residuals
-            shift_tokens=1,  # shift features by 1 token (helps char-level)
-            softclamp_output=True,  # Gemma 2: soft-clamp final hidden states
-            zero_init_branch_output=True,  # GPT-NeoX: zero-init output projections
-        ),
+    """Build the byte-embedding diffusion model."""
+    unet = Unet1D(
+        dim=UNET_DIM,
+        init_dim=UNET_INIT_DIM,
+        dim_mults=UNET_DIM_MULTS,
+        channels=EMB_DIM,
+        dropout=UNET_DROPOUT,
+        self_condition=SELF_CONDITION,
+        learned_sinusoidal_cond=LEARNED_SINUSOIDAL,
+        learned_sinusoidal_dim=LEARNED_SINUSOIDAL_DIM,
+        attn_dim_head=ATTN_DIM_HEAD,
+        attn_heads=ATTN_HEADS,
     )
 
-    # Wrap for autoregressive language modeling (handles input/target split + loss)
-    ar_model = AutoregressiveWrapper(model)
-    return ar_model
+    diffusion = GaussianDiffusion1D(
+        model=unet,
+        seq_length=SEQ_LEN,
+        timesteps=TIMESTEPS,
+        sampling_timesteps=SAMPLING_TIMESTEPS,
+        objective=OBJECTIVE,
+        beta_schedule=BETA_SCHEDULE,
+        ddim_sampling_eta=DDIM_SAMPLING_ETA,
+        auto_normalize=True,
+        channel_first=True,
+    )
+
+    model = ByteEmbeddingDiffusion(
+        vocab_size=VOCAB_SIZE,
+        emb_dim=EMB_DIM,
+        unet=unet,
+        diffusion=diffusion,
+    )
+    return model
 
 
 # ---------------------------------------------------------------------------
@@ -236,34 +276,22 @@ def build_model():
 
 
 def build_optimizer(model):
-    """Build MuonAdamAtan2 optimizer (or fallback to AdamW)."""
-    if HAS_MUON:
-        # x-transformers TransformerWrapper exposes .muon_parameters()
-        # which returns the linear weight matrices suitable for Muon
-        inner_model = model.net  # unwrap AutoregressiveWrapper -> TransformerWrapper
-        optimizer = MuonAdamAtan2(
-            muon_params=inner_model.muon_parameters(),
-            params=inner_model.parameters(),
-            remove_muon_params_from_params=True,
-            lr=LEARNING_RATE,
-            weight_decay=0.001,  # very small decoupled WD
-            decoupled_wd=True,
-            betas=(0.92, 0.99),  # AdamAtan2 betas matching muon_beta1
-            muon_rms_factor=0.1,  # smaller Muon updates (default 0.2)
-            muon_beta1=0.92,  # less momentum than default 0.95
-        )
-    else:
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=LEARNING_RATE,
-            weight_decay=WEIGHT_DECAY,
-        )
-    return optimizer
+    """Build AdamW optimizer."""
+    return torch.optim.AdamW(
+        model.parameters(),
+        lr=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY,
+        betas=(0.9, 0.99),
+    )
 
 
 # ---------------------------------------------------------------------------
 # LR Schedule (time-based, matching Karpathy's autoresearch pattern)
 # ---------------------------------------------------------------------------
+
+WARMUP_RATIO = 0.05
+WARMDOWN_RATIO = 0.40
+FINAL_LR_FRAC = 0.1
 
 
 def get_lr_multiplier(progress):
@@ -283,28 +311,37 @@ def get_lr_multiplier(progress):
 
 
 def get_precision_context():
-    """Return the appropriate AMP context manager.
-
-    FP8 note: torchao FP8 converts nn.Linear layers in-place to use FP8
-    compute kernels. The autocast wrapper is still BF16 for non-linear ops.
-    """
+    """Return the appropriate AMP context manager."""
     if USE_FP16:
         return torch.amp.autocast(device_type="cuda", dtype=torch.float16)
     else:
-        # BF16 for both default and FP8 modes (FP8 is handled by torchao layer conversion)
         return torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 
 
 # ---------------------------------------------------------------------------
-# Estimate FLOPs
+# Evaluation: Denoising loss (lower is better)
 # ---------------------------------------------------------------------------
 
 
-def estimate_flops_per_token(num_params, seq_len, depth, heads, dim):
-    """Rough FLOPs per token estimate (forward + backward ≈ 6N + attention)."""
-    head_dim = dim // heads
-    attn_flops = 12 * heads * head_dim * seq_len * depth
-    return 6 * num_params + attn_flops
+@torch.no_grad()
+def evaluate(model, val_loader, precision_ctx, num_eval_batches=NUM_EVAL_BATCHES):
+    """
+    Compute mean denoising loss on validation set.
+    val_loss: MSE-based denoising loss (lower = better model)
+    val_bpd:  val_loss / ln(2)  (rough bits-per-dim conversion)
+    """
+    model.eval()
+    total_loss = 0.0
+
+    for _ in range(num_eval_batches):
+        data = next(val_loader)
+        with precision_ctx:
+            loss = model(data)
+        total_loss += loss.item()
+
+    avg_loss = total_loss / num_eval_batches
+    bpd = avg_loss / math.log(2)
+    return avg_loss, bpd
 
 
 # ---------------------------------------------------------------------------
@@ -318,12 +355,7 @@ def main():
     torch.cuda.manual_seed(42)
     torch.set_float32_matmul_precision("high")
 
-    if USE_FP8 and fp8_available:
-        precision_tag = "FP8"
-    elif USE_FP16:
-        precision_tag = "FP16"
-    else:
-        precision_tag = "BF16"
+    precision_tag = "FP16" if USE_FP16 else "BF16"
     print(f"Precision: {precision_tag}")
     print(f"Device: {torch.cuda.get_device_name(0)}")
     print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
@@ -331,50 +363,41 @@ def main():
     # Data
     print("Loading enwik8...")
     data_train, data_val = load_enwik8()
-    train_dataset = TextSamplerDataset(data_train, MAX_SEQ_LEN)
-    val_dataset = TextSamplerDataset(data_val, MAX_SEQ_LEN)
+    train_dataset = ByteSequenceDataset(data_train, SEQ_LEN)
+    val_dataset = ByteSequenceDataset(data_val, SEQ_LEN)
     train_loader = cycle(
         DataLoader(train_dataset, batch_size=BATCH_SIZE, drop_last=True)
     )
     val_loader = cycle(DataLoader(val_dataset, batch_size=BATCH_SIZE, drop_last=True))
 
     # Model
-    print(f"Building model: dim={MODEL_DIM}, depth={MODEL_DEPTH}, heads={MODEL_HEADS}")
-    ar_model = build_model()
-    ar_model.cuda()
+    print(
+        f"Building model: unet_dim={UNET_DIM}, dim_mults={UNET_DIM_MULTS}, "
+        f"emb_dim={EMB_DIM}, seq_len={SEQ_LEN}, T={TIMESTEPS}, obj={OBJECTIVE}, "
+        f"self_cond={SELF_CONDITION}, dropout={UNET_DROPOUT}"
+    )
+    model = build_model()
+    model.cuda()
 
-    num_params = sum(p.numel() for p in ar_model.parameters())
+    num_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {num_params:,} ({num_params / 1e6:.1f}M)")
 
-    # FP8: convert nn.Linear layers to use FP8 compute (before optimizer creation)
-    if USE_FP8 and fp8_available:
-        fp8_config = Float8LinearConfig(pad_inner_dim=True)
-        convert_to_float8_training(ar_model.net.attn_layers, config=fp8_config)
-        print("FP8: transformer attention/FFN layers converted to float8 training")
-
-    flops_per_token = estimate_flops_per_token(
-        num_params, MAX_SEQ_LEN, MODEL_DEPTH, MODEL_HEADS, MODEL_DIM
-    )
-    print(f"Estimated FLOPs per token: {flops_per_token:.2e}")
-
     # Optimizer
-    optimizer = build_optimizer(ar_model)
+    optimizer = build_optimizer(model)
     initial_lr = LEARNING_RATE
 
-    # Compile model for speed (PyTorch 2.0+)
+    # Compile model
     try:
-        ar_model = torch.compile(ar_model, dynamic=False)
+        model = torch.compile(model, dynamic=False)
         print("torch.compile: enabled")
     except Exception as e:
         print(f"torch.compile: failed ({e}), running eager mode")
 
-    # Effective batch size
-    effective_batch_tokens = BATCH_SIZE * MAX_SEQ_LEN * GRADIENT_ACCUMULATE_EVERY
+    effective_batch_tokens = BATCH_SIZE * SEQ_LEN * GRADIENT_ACCUMULATE_EVERY
     print(
-        f"Effective batch: {BATCH_SIZE} x {MAX_SEQ_LEN} x {GRADIENT_ACCUMULATE_EVERY} = {effective_batch_tokens:,} tokens"
+        f"Effective batch: {BATCH_SIZE} x {SEQ_LEN} x {GRADIENT_ACCUMULATE_EVERY} = {effective_batch_tokens:,} tokens"
     )
     print(f"Time budget: {TIME_BUDGET}s")
-    print(f"Optimizer: {'MuonAdamAtan2' if HAS_MUON else 'AdamW'}")
 
     # Training loop
     t_start_training = time.time()
@@ -387,20 +410,20 @@ def main():
         torch.cuda.synchronize()
         t0 = time.time()
 
-        ar_model.train()
+        model.train()
 
         # Gradient accumulation
         accumulated_loss = 0.0
         for _ in range(GRADIENT_ACCUMULATE_EVERY):
             with precision_ctx:
-                loss = ar_model(next(train_loader))
+                loss = model(next(train_loader))
             (loss / GRADIENT_ACCUMULATE_EVERY).backward()
             accumulated_loss += loss.item()
 
         train_loss = accumulated_loss / GRADIENT_ACCUMULATE_EVERY
 
         # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(ar_model.parameters(), GRAD_CLIP)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
 
         # LR schedule
         progress = (
@@ -416,8 +439,8 @@ def main():
         optimizer.zero_grad()
 
         # Fast fail
-        if train_loss > 100:
-            print("\nFAIL: loss exploded")
+        if train_loss > 100 or math.isnan(train_loss):
+            print("\nFAIL: loss exploded or NaN")
             sys.exit(1)
 
         torch.cuda.synchronize()
@@ -434,16 +457,11 @@ def main():
         debiased_loss = smooth_loss / (1 - ema_beta ** (step + 1))
         pct_done = 100 * progress
         tok_per_sec = int(effective_batch_tokens / dt) if dt > 0 else 0
-        mfu = (
-            100 * flops_per_token * effective_batch_tokens / dt / GPU_BF16_PEAK_FLOPS
-            if dt > 0
-            else 0
-        )
         remaining = max(0, TIME_BUDGET - total_training_time)
-        bpc = debiased_loss / math.log(2)
+        bpd = debiased_loss / math.log(2)
 
         print(
-            f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_loss:.6f} | bpc: {bpc:.4f} | lr: {current_lr:.2e} | dt: {dt * 1000:.0f}ms | tok/s: {tok_per_sec:,} | mfu: {mfu:.1f}% | remain: {remaining:.0f}s    ",
+            f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_loss:.6f} | bpd: {bpd:.4f} | lr: {current_lr:.2e} | dt: {dt * 1000:.0f}ms | tok/s: {tok_per_sec:,} | remain: {remaining:.0f}s    ",
             end="",
             flush=True,
         )
@@ -451,23 +469,21 @@ def main():
         # Validation
         if step % VALIDATE_EVERY == 0 and step > 0:
             with precision_ctx:
-                val_bpc = evaluate_bpc(ar_model, val_loader)
-            print(f"\n  [val] bpc: {val_bpc:.4f}")
+                val_loss, val_bpd = evaluate(model, val_loader, precision_ctx)
+            print(f"\n  [val] loss: {val_loss:.6f}  bpd: {val_bpd:.4f}")
 
-        # Text generation
+        # Generation (nearest-neighbor decode to bytes)
         if step % GENERATE_EVERY == 0 and step > 0:
-            ar_model.eval()
-            inp = random.choice(val_dataset)[:-1]
-            prime = decode_tokens(inp)
-            print(f"\n  [gen] prompt: {prime[:80]}...")
-            with precision_ctx:
-                sample = ar_model.generate(
-                    prompts=inp.unsqueeze(0),
-                    seq_len=GENERATE_LENGTH,
-                    cache_kv=True,
-                )
-            output_str = decode_tokens(sample[0].tolist())
-            print(f"  [gen] output: {output_str[:200]}...")
+            model.eval()
+            try:
+                with precision_ctx:
+                    # Use the underlying module if compiled
+                    raw = model._orig_mod if hasattr(model, "_orig_mod") else model
+                    token_ids = raw.sample(batch_size=1)
+                generated = decode_tokens(token_ids[0].tolist())
+                print(f"\n  [gen] {generated[:120]!r}")
+            except Exception as e:
+                print(f"\n  [gen] failed: {e}")
 
         # GC management
         if step == 0:
@@ -479,7 +495,7 @@ def main():
 
         step += 1
 
-        # Time's up (only stop after warmup)
+        # Time's up
         if step > 5 and total_training_time >= TIME_BUDGET:
             break
 
@@ -488,36 +504,37 @@ def main():
     total_tokens = step * effective_batch_tokens
 
     # Final eval
-    ar_model.eval()
+    model.eval()
     with precision_ctx:
-        val_bpc = evaluate_bpc(ar_model, val_loader, num_eval_batches=100)
+        val_loss, val_bpd = evaluate(
+            model, val_loader, precision_ctx, num_eval_batches=100
+        )
 
-    # Final summary (matching Karpathy's output format for compatibility)
+    # Final summary
     t_end = time.time()
     peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
-    steady_state_mfu = (
-        (
-            100
-            * flops_per_token
-            * effective_batch_tokens
-            * max(1, step - 5)
-            / total_training_time
-            / GPU_BF16_PEAK_FLOPS
-        )
-        if total_training_time > 0
-        else 0
-    )
 
     print("---")
-    print(f"val_bpc:          {val_bpc:.6f}")
+    print(f"val_loss:         {val_loss:.6f}")
+    print(f"val_bpd:          {val_bpd:.6f}")
     print(f"training_seconds: {total_training_time:.1f}")
     print(f"total_seconds:    {t_end - t_start:.1f}")
     print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
-    print(f"mfu_percent:      {steady_state_mfu:.2f}")
     print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
     print(f"num_steps:        {step}")
     print(f"num_params_M:     {num_params / 1e6:.1f}")
-    print(f"depth:            {MODEL_DEPTH}")
+    print(f"seq_len:          {SEQ_LEN}")
+    print(f"emb_dim:          {EMB_DIM}")
+    print(f"unet_dim:         {UNET_DIM}")
+    print(f"dim_mults:        {UNET_DIM_MULTS}")
+    print(f"batch_size:       {BATCH_SIZE}")
+    print(f"grad_accum:       {GRADIENT_ACCUMULATE_EVERY}")
+    print(f"lr:               {LEARNING_RATE}")
+    print(f"timesteps:        {TIMESTEPS}")
+    print(f"objective:        {OBJECTIVE}")
+    print(f"beta_schedule:    {BETA_SCHEDULE}")
+    print(f"self_condition:   {SELF_CONDITION}")
+    print(f"dropout:          {UNET_DROPOUT}")
     print(f"precision:        {precision_tag}")
 
 

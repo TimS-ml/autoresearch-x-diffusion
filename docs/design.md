@@ -1,7 +1,7 @@
 # x-DDPM Autoresearch — Design Decisions
 
-This document records the design choices made when extending the autoresearch framework
-from x-transformers (autoregressive LM) to x-DDPM (denoising diffusion).
+This document records the design choices made for the autoresearch framework
+using x-DDPM (denoising diffusion) on enwik8 byte sequences.
 
 ---
 
@@ -98,11 +98,10 @@ sampling in fewer steps with minimal quality loss.
 
 ---
 
-## 8. Optimizer: AdamW (not MuonAdamAtan2)
+## 8. Optimizer: AdamW
 
-The Muon optimizer is designed for Transformer weight matrices. The Unet1D has Conv1d
-layers, not linear projection matrices. Muon's gradient orthogonalization is not
-obviously beneficial for conv kernels.
+The Unet1D has Conv1d layers, not linear projection matrices. Muon's gradient
+orthogonalization is not obviously beneficial for conv kernels.
 
 **Choice**: Standard `AdamW` with `lr=1e-4`, `betas=(0.9, 0.99)`.
 
@@ -110,12 +109,9 @@ obviously beneficial for conv kernels.
 
 ## 9. Metric: `val_loss` (denoising MSE) and `val_bpd`
 
-**Key difference from autoregressive LM**: There is no direct BPC equivalent for diffusion.
-
 - `val_loss`: Mean denoising MSE over the validation set. This is the ELBO-like training objective.
   Lower is better. Comparable across runs on the same architecture.
 - `val_bpd`: `val_loss / ln(2)` — rough conversion to bits-per-dim.
-  NOT the same as AR BPC; cannot compare across LM and diffusion models.
 
 The primary tracking metric for the autoresearch loop is `val_loss`.
 We also store `val_bpd` for legibility.
@@ -153,13 +149,12 @@ No new data download required. Same 90M train / 5M val split.
 ## File Structure
 
 ```
-train_diffusion.py          # DDPM training script (edit this for experiments)
-train.py                    # Original AR LM script (unchanged)
+train.py                    # DDPM training script (edit this for experiments)
+program.md                  # Agent instructions
 x-DDPM/                     # x-DDPM library (read-only, gitignored)
 docs/design.md              # This file
 docs/adjustable_params.md   # x-DDPM parameter reference
-program_diffusion.md        # Agent instructions for DDPM loop
-results_diffusion.tsv       # Experiment log (gitignored, created at runtime)
+results.tsv                 # Experiment log (gitignored, created at runtime)
 ```
 
 ---
@@ -181,7 +176,7 @@ Key findings:
 ## Experiment Ideas (Priority Order)
 
 1. **Baseline**: dim=64, mults=(1,2,4), pred_v, seq=128 — val_loss=0.009394 (established)
-2. **Larger model**: dim=128, mults=(1,2,4,8) — val_loss=0.004723 ✓ (better)
+2. **Larger model**: dim=128, mults=(1,2,4,8) — val_loss=0.004723 (better)
 3. **Even larger**: dim=256, mults=(1,2,4,8) with BATCH_SIZE=32 (VRAM allows it)
 4. **Sequence length**: Try `SEQ_LEN=256` with `BATCH_SIZE=32`
 5. **Batch size**: Try `BATCH_SIZE=128` (more throughput per step)

@@ -1,6 +1,6 @@
 # x-DDPM Adjustable Parameters
 
-Complete reference for all tunable parameters in `train_diffusion.py`.
+Complete reference for all tunable parameters in `train.py`.
 Parameters are sourced from x-DDPM's `Unet1D` and `GaussianDiffusion1D` classes.
 Goal: minimize `val_loss` (denoising MSE) within the 5-minute time budget.
 
@@ -129,21 +129,6 @@ VRAM is extremely low because:
 - Conv1d layers are memory-efficient
 
 **The 24 GB budget is barely touched.** You can safely try dim=256 or BATCH_SIZE=256.
-
----
-
-## Key Differences from x-transformers LM
-
-| Property | x-transformers (AR LM) | x-DDPM (diffusion) |
-|----------|----------------------|---------------------|
-| Data | Discrete tokens | Continuous embeddings |
-| Forward pass | Autoregressive (causal) | U-Net denoising at random timestep t |
-| Loss | Cross-entropy | MSE (denoising) |
-| Metric | `val_bpc` (bits/char) | `val_loss` (MSE) |
-| Generation | Token-by-token | Iterative denoising (50-1000 steps) |
-| Optimizer | MuonAdamAtan2 | AdamW (Conv layers, no Muon benefit) |
-| Batch size | 24 (long context) | 64+ (short context, no KV cache) |
-| VRAM | ~8 GB | ~0.2-1.4 GB |
 
 ---
 

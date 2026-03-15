@@ -1,126 +1,175 @@
-# autoresearch (x-transformers edition)
+# autoresearch (x-DDPM edition)
 
-This is an experiment to have the LLM do its own research on character-level
-language modeling using [x-transformers](https://github.com/lucidrains/x-transformers).
+Autonomous LLM-driven research on denoising diffusion models for enwik8 byte sequences,
+using [denoising-diffusion-pytorch](https://github.com/lucidrains/denoising-diffusion-pytorch).
+
+---
 
 ## Setup
 
 To set up a new experiment, work with the user to:
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar10`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
+1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar15`).
+   The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
 2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current HEAD.
 3. **Read the in-scope files**: The repo is small. Read these files for full context:
-   - `AGENTS.md` — **machine-specific overrides** (Python path, GPU VRAM, precision, etc.). Always read this first and follow its settings. This file is not committed — it is customized per machine.
-   - `train.py` — the file you modify. Model config, optimizer, training loop.
-   - `docs/adjustable_params.md` — x-transformers parameter reference.
-4. **Verify data exists**: Check that `./x-transformers/data/enwik8.gz` exists. If not, download it.
-5. **Verify dependencies**: Run `python -c "from x_transformers import TransformerWrapper"` to check. If missing deps, install:
+   - `AGENTS.md` — **machine-specific overrides** (Python path, GPU VRAM, etc.). Read first.
+   - `train.py` — the file you modify. All config is in this file.
+   - `docs/adjustable_params.md` — x-DDPM parameter reference.
+   - `docs/design.md` — design decisions and rationale.
+4. **Verify data exists**: Check that `./x-transformers/data/enwik8.gz` exists.
+5. **Verify dependencies**: Run:
    ```bash
-   pip install loguru einx ema-pytorch adam-atan2-pytorch
-   # Optional FP8:
-   pip install --no-build-isolation transformer_engine[pytorch]
+   python -c "from denoising_diffusion_pytorch import Unet1D, GaussianDiffusion1D; print('OK')"
    ```
-6. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
-7. **Confirm and go**: Confirm setup looks good.
+   If missing, install:
+   ```bash
+   pip install denoising-diffusion-pytorch einops accelerate ema-pytorch tqdm
+   ```
+6. **Initialize results.tsv**: Create with just the header row.
+7. **Confirm and go**.
 
-Once you get confirmation, kick off the experimentation.
+---
 
 ## Experimentation
 
-Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). Launch it as:
+Each experiment runs on a single GPU for a **fixed 5-minute time budget**.
 
 ```bash
-python train.py                       # BF16 (default)
-USE_FP8=1 python train.py             # FP8 via Transformer Engine (if installed)
+python train.py > run.log 2>&1
 ```
 
 **What you CAN do:**
-- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture parameters, x-transformers Decoder options, optimizer, hyperparameters, training loop, batch size, model size, etc.
+- Modify `train.py` — this is the only file you edit.
+  Everything is fair game: model dimensions, diffusion parameters, optimizer,
+  batch size, embedding dim, sequence length.
 
 **What you CANNOT do:**
-- Modify files inside `x-transformers/`. The library is read-only reference.
+- Modify files inside `x-DDPM/`. The library is read-only reference.
 - Break the output format (the `---` summary block at the end must remain parseable).
 
-**The goal is simple: get the lowest val_bpc.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
+**Goal**: Minimize `val_loss` (denoising MSE). Lower = better denoising = better model.
+`val_bpd = val_loss / ln(2)` is logged as a secondary metric.
 
-**VRAM** is a hard constraint. OOM = crash. Be conservative with batch sizes and model dimensions.
+**VRAM** is a hard constraint. OOM = crash.
 
-**Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_bpc improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_bpc improvement from deleting code? Definitely keep.
+**Simplicity criterion**: All else being equal, simpler is better. A small improvement
+that adds ugly complexity is not worth it. Conversely, removing something and getting
+equal or better results is a great outcome — that's a simplification win.
 
-**The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
+**The first run**: Establish baseline with the default config as-is.
 
-## Output format
+---
 
-Once the script finishes it prints a summary like this:
+## Output Format
 
 ```
 ---
-val_bpc:          1.234567
-training_seconds: 300.1
-total_seconds:    325.9
-peak_vram_mb:     12345.6
-mfu_percent:      15.00
-total_tokens_M:   200.0
-num_steps:        500
-num_params_M:     19.5
-depth:            6
+val_loss:         0.009394
+val_bpd:          0.013552
+training_seconds: 300.0
+total_seconds:    342.0
+peak_vram_mb:     227.8
+total_tokens_M:   81.2
+num_steps:        9909
+num_params_M:     4.6
+seq_len:          128
+emb_dim:          32
+unet_dim:         64
+dim_mults:        (1, 2, 4)
+batch_size:       64
+grad_accum:       1
+lr:               0.0001
+timesteps:        1000
+objective:        pred_v
+beta_schedule:    cosine
+self_condition:   False
+dropout:          0.0
 precision:        BF16
 ```
 
-You can extract the key metric from the log file:
-
+Extract the key metric:
+```bash
+grep "^val_loss:" run.log
 ```
-grep "^val_bpc:" run.log
+
+---
+
+## Logging Results
+
+Log to `results.tsv` (tab-separated, NOT comma-separated).
+
+Header and columns:
 ```
-
-## Logging results
-
-When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
-
-The TSV has a header row and 5 columns:
-
-```
-commit	val_bpc	memory_gb	status	description
+commit	val_loss	memory_gb	status	description
 ```
 
 1. git commit hash (short, 7 chars)
-2. val_bpc achieved (e.g. 1.234567) — use 0.000000 for crashes
-3. peak memory in GB, round to .1f (divide peak_vram_mb by 1024) — use 0.0 for crashes
+2. val_loss (e.g. 0.123456) — use 0.000000 for crashes
+3. peak memory in GB, round to .1f — use 0.0 for crashes
 4. status: `keep`, `discard`, or `crash`
-5. short text description of what this experiment tried
+5. short description
 
 Example:
-
 ```
-commit	val_bpc	memory_gb	status	description
-a1b2c3d	1.234567	8.5	keep	baseline (dim=512 depth=6 heads=8 bf16)
-b2c3d4e	1.220000	8.6	keep	add ff_glu=True ff_swish=True
-c3d4e5f	1.250000	8.5	discard	reduce depth to 4
-d4e5f6g	0.000000	0.0	crash	dim=1024 OOM
+commit	val_loss	memory_gb	status	description
+a1b2c3d	0.123456	4.0	keep	baseline (dim=64 emb=32 seq=128 pred_v)
+b2c3d4e	0.118000	4.1	keep	unet_dim=128 batch=32
+c3d4e5f	0.130000	4.0	discard	pred_noise worse than pred_v
+d4e5f6g	0.000000	0.0	crash	emb_dim=128 OOM
 ```
 
-## The experiment loop
+---
 
-The experiment runs on a dedicated branch (e.g. `autoresearch/mar10`).
+## The Experiment Loop
 
-LOOP FOREVER:
+LOOP FOREVER on the dedicated branch:
 
-1. Look at the git state: the current branch/commit we're on
-2. Tune `train.py` with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment: `python train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_bpc:\|^peak_vram_mb:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If val_bpc improved (lower), you "advance" the branch, keeping the git commit
-9. If val_bpc is equal or worse, you git reset back to where you started
+1. Check git state (branch/commit).
+2. Modify `train.py` with an experimental idea.
+3. `git commit`
+4. Run: `python train.py > run.log 2>&1`
+5. Check results: `grep "^val_loss:\|^peak_vram_mb:" run.log`
+6. If empty -> crash. Check `tail -n 50 run.log` for stack trace.
+7. Log to `results.tsv`.
+8. If val_loss improved (lower) -> keep commit, advance branch.
+9. If not improved -> `git reset --hard HEAD~1` (discard commit).
 
-The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
+The idea is that you are a completely autonomous researcher trying things out.
+If they work, keep. If they don't, discard. And you're advancing the branch
+so that you can iterate.
 
-**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
+**Timeout**: If a run exceeds 10 minutes, kill it. Treat as failure.
 
-**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
+**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment:
+If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it
+and re-run. If the idea itself is fundamentally broken, just skip it, log "crash"
+as the status in the tsv, and move on.
 
-**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read `docs/adjustable_params.md` and the x-transformers source for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
+**NEVER STOP**: Once the experiment loop has begun (after the initial setup),
+do NOT pause to ask the human if you should continue. Do NOT ask "should I keep
+going?" or "is this a good stopping point?". The human might be asleep, or gone
+from a computer and expects you to continue working *indefinitely* until you are
+manually stopped. You are autonomous. If you run out of ideas, think harder —
+read `docs/adjustable_params.md` and the x-DDPM source for new angles, try
+combining previous near-misses, try more radical architectural changes.
+The loop runs until the human interrupts you, period.
 
-As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+---
+
+## Experiment Ideas
+
+See `docs/adjustable_params.md` for full details. Priority order:
+
+1. Baseline (as-is)
+2. Tune `LEARNING_RATE`: try `3e-4`, `5e-5`
+3. `BATCH_SIZE=128` (more throughput per step)
+4. `UNET_DIM=128` with `BATCH_SIZE=32`
+5. `self_condition=True` in Unet1D
+6. `UNET_DIM_MULTS=(1,2,4,8)` with `SEQ_LEN=128`
+7. `EMB_DIM=64`
+8. `SEQ_LEN=256` with `BATCH_SIZE=32`
+9. `OBJECTIVE='pred_noise'` vs `pred_v`
+10. `TIMESTEPS=500` (more steps in budget)
+11. `learned_sinusoidal_cond=True`
+12. `dropout=0.1` in ResNet blocks
