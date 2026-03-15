@@ -164,15 +164,29 @@ results_diffusion.tsv       # Experiment log (gitignored, created at runtime)
 
 ---
 
+## Empirical Results (Test Runs)
+
+| Run | Config | val_loss | peak_vram | note |
+|-----|--------|----------|-----------|------|
+| Baseline | dim=64, mults=(1,2,4), pred_v | 0.009394 | 0.2 GB | |
+| Larger model | dim=128, mults=(1,2,4,8), pred_v | 0.004723 | 1.4 GB | significantly better |
+| pred_noise | dim=64, mults=(1,2,4), pred_noise | 0.014233 | 0.2 GB | worse than pred_v |
+
+Key findings:
+- VRAM usage is extremely low (0.2-1.4 GB) — can scale up aggressively.
+- `pred_v` substantially outperforms `pred_noise` (as expected for cosine schedule).
+- Bigger model (57M, dim=128, 4 levels) achieves 2x lower val_loss with only 7x more VRAM.
+- ~10K steps/5min for small model, ~5K steps/5min for 57M model.
+
 ## Experiment Ideas (Priority Order)
 
-1. **Baseline**: Establish baseline `val_loss` with default config.
-2. **Batch size**: Try `BATCH_SIZE=32` (larger model) or `BATCH_SIZE=128` (more throughput).
-3. **Unet dim**: Try `UNET_DIM=128` (deeper/wider) — watch VRAM.
-4. **Objective**: Try `pred_noise` and `pred_x0` vs `pred_v`.
-5. **Sequence length**: Try `SEQ_LEN=256` with `BATCH_SIZE=32`.
-6. **EMB_DIM**: Try 64 or 16.
-7. **Self-conditioning**: Enable `self_condition=True` in `Unet1D`.
-8. **dim_mults**: Try `(1, 2, 4, 8)` — adds one more resolution level.
-9. **Timesteps**: Try `T=500` (faster per-step, more steps in budget).
-10. **DDIM eta**: Try `ddim_sampling_eta=1.0` (DDPM sampling).
+1. **Baseline**: dim=64, mults=(1,2,4), pred_v, seq=128 — val_loss=0.009394 (established)
+2. **Larger model**: dim=128, mults=(1,2,4,8) — val_loss=0.004723 ✓ (better)
+3. **Even larger**: dim=256, mults=(1,2,4,8) with BATCH_SIZE=32 (VRAM allows it)
+4. **Sequence length**: Try `SEQ_LEN=256` with `BATCH_SIZE=32`
+5. **Batch size**: Try `BATCH_SIZE=128` (more throughput per step)
+6. **Self-conditioning**: Enable `self_condition=True` in `Unet1D` (~25% more compute)
+7. **EMB_DIM=64**: Richer byte representation
+8. **LR tuning**: Try `LEARNING_RATE=3e-4` or `5e-5`
+9. **Timesteps**: Try `TIMESTEPS=500` (more gradient steps per budget)
+10. **pred_x0**: Compare vs pred_v
