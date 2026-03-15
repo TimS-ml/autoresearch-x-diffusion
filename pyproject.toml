@@ -1,7 +1,7 @@
 [project]
 name = "autoresearch"
-version = "0.2.0"
-description = "Autonomous LLM-driven research on character-level language modeling with x-transformers"
+version = "0.3.0"
+description = "Autonomous LLM-driven research on x-transformers LM and x-DDPM diffusion, enwik8"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -15,6 +15,13 @@ dependencies = [
     "adam-atan2-pytorch",
     "x-transformers @ git+https://github.com/TimS-ml/x-transformers.git",
     "torchao>=0.16.0",
+    # x-DDPM dependencies
+    "einops",
+    "accelerate",
+    "tqdm",
+    "scipy",
+    "Pillow",
+    "torchvision",
 ]
 
 [project.optional-dependencies]

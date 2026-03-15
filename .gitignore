@@ -1,9 +1,14 @@
-x-transformers
+x-DDPM
 analysis.py
+analysis_diffusion.py
 results.tsv
+results_diffusion.tsv
 run.log
+run_diff.log
 progress.png
 memory.png
+progress_diff.png
+memory_diff.png
 
 .DS_Store
 .idea

@@ -1,302 +1,151 @@
-# x-transformers Adjustable Parameters
+# x-DDPM Adjustable Parameters
 
-Comprehensive reference of all adjustable parameters for the `Decoder` and
-`TransformerWrapper` classes used in `train.py`. Extracted from the
-[x-transformers README](https://github.com/lucidrains/x-transformers).
-
-**How to use this:** When editing `train.py`, you configure these parameters in
-the `build_model()` function, in the `TransformerWrapper(...)` and
-`Decoder(...)` constructors.
+Reference for all parameters in `train_diffusion.py`. The goal is to lower `val_loss`
+(denoising MSE) within the 5-minute time budget.
 
 ---
 
-## Table of Contents
+## Data Parameters
 
-- [Core Architecture](#core-architecture)
-- [Normalization](#normalization)
-- [Feedforward Network](#feedforward-network)
-- [Attention](#attention)
-- [Positional Encoding](#positional-encoding)
-- [Regularization & Dropout](#regularization--dropout)
-- [Residual Connections](#residual-connections)
-- [Memory & Recurrence](#memory--recurrence)
-- [Layer Structure](#layer-structure)
-- [TransformerWrapper-level Options](#transformerwrapper-level-options)
-- [AutoregressiveWrapper Options](#autoregressivewrapper-options)
-- [Recommended Combinations](#recommended-combinations)
-- [Model Sizing Guide](#model-sizing-guide)
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `SEQ_LEN` | `128` | Bytes per sample. Must be divisible by `2^(len(UNET_DIM_MULTS)-1)`. Longer = more context, larger memory. |
+| `VOCAB_SIZE` | `256` | Fixed. enwik8 is byte-level. Do not change. |
 
 ---
 
-## Core Architecture
+## Embedding
 
-These are the fundamental parameters that determine model size and capacity.
-
-| Parameter | Type | Default | Where | Description |
-|-----------|------|---------|-------|-------------|
-| `dim` | int | — | Decoder | Model hidden dimension. Primary knob for model capacity. |
-| `depth` | int | — | Decoder | Number of transformer layers. More depth = more capacity but slower. |
-| `heads` | int | 8 | Decoder | Number of attention heads. Usually `dim // 64` or `dim // 128`. |
-| `num_tokens` | int | — | TransformerWrapper | Vocabulary size (256 for byte-level enwik8). |
-| `max_seq_len` | int | — | TransformerWrapper | Maximum sequence length. |
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `EMB_DIM` | `32` | Continuous dimension per byte token. Larger = richer but more VRAM. Try 16, 64. Must match `Unet1D(channels=EMB_DIM)`. |
 
 ---
 
-## Normalization
+## Unet1D Architecture
 
-Different normalization strategies affect training stability and convergence speed.
+These parameters control the backbone denoising network.
 
-| Parameter | Type | Default | Description | Paper |
-|-----------|------|---------|-------------|-------|
-| `use_rmsnorm` | bool | False | RMSNorm instead of LayerNorm. Simpler, no mean centering. Found to be best variant. Used in Retro, Gopher, LLaMA. | [Zhang & Sennrich 2019](https://arxiv.org/abs/1910.07467) |
-| `use_simple_rmsnorm` | bool | False | Even simpler: `l2norm(x) * sqrt(dim)` with no learned gamma. No performance loss per TransNormer paper. | [Qin et al. 2023](https://arxiv.org/abs/2307.14995) |
-| `use_scalenorm` | bool | False | ScaleNorm — simpler alternative to LayerNorm. Faster convergence reported. | [Nguyen & Salazar 2019](https://arxiv.org/abs/1910.05895) |
-| `sandwich_norm` | bool | False | Extra layernorm on branch outputs (pre-norm + post-norm on each sublayer). Stabilizes training. From CogView. | [Ding et al. 2021](https://arxiv.org/abs/2105.13290) |
-| `resi_dual` | bool | False | Hybrid pre+post layernorm. Reduces representation collapse while maintaining stability. | [Microsoft 2023](https://arxiv.org/abs/2304.14802) |
-| `resi_dual_scale` | float | 0.1 | Scale factor for prenorm residual in resi_dual (prevents fp16 overflow). | |
-| `pre_norm` | bool | True | Use pre-layernorm (default). Set False for post-layernorm. | |
-| `attn_head_scale` | bool | False | Per-head scaling after attention aggregation (Normformer). Slight convergence improvement. | [Normformer 2022](https://openreview.net/forum?id=GMYWzWztDx5) |
-| `ff_post_act_ln` | bool | False | Extra layernorm after feedforward activation (Normformer). | [Normformer 2022](https://openreview.net/forum?id=GMYWzWztDx5) |
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `UNET_DIM` | `64` | Base channel dimension. Wider = more expressive, more VRAM. Try 32, 128. |
+| `UNET_DIM_MULTS` | `(1, 2, 4)` | Channel multipliers at each resolution level. More levels = deeper U-Net but `SEQ_LEN` must be divisible by `2^(len-1)`. |
+| `channels` | `EMB_DIM` | Input channel count. Set via `EMB_DIM`. |
+| `self_condition` | `False` | Self-conditioning: feed previous prediction back as extra input. Costs ~25% more compute, improves quality. |
+| `learned_sinusoidal_cond` | `False` | Use learned sinusoidal timestep embeddings instead of fixed. |
+| `random_fourier_features` | `False` | Use random Fourier features for timestep embedding (fixed random). |
+| `attn_dim_head` | `32` | Dimension per attention head in bottleneck. |
+| `attn_heads` | `4` | Number of attention heads in bottleneck. |
+| `dropout` | `0.` | Dropout in ResNet blocks. Try 0.1 if overfitting. |
 
----
+### dim_mults Guide
 
-## Feedforward Network
-
-The feedforward (MLP) block processes each position independently after attention.
-
-| Parameter | Type | Default | Description | Paper |
-|-----------|------|---------|-------------|-------|
-| `ff_glu` | bool | False | **Gated Linear Unit** in feedforward. Usually helps. "You should always turn this on." | [Shazeer 2020](https://arxiv.org/abs/2002.05202) |
-| `ff_swish` | bool | False | Use Swish activation. Combine with `ff_glu=True` for **SwiGLU** (used in PaLM, LLaMA). | [PaLM 2022](https://arxiv.org/abs/2204.02311) |
-| `ff_relu_squared` | bool | False | ReLU^2 activation (from Primer NAS). Simpler and better than GELU in autoregressive setting. **Note:** if using GLU, GELU still better. | [So et al. 2021](https://arxiv.org/abs/2109.08668) |
-| `ff_mult` | int | 4 | FFN expansion factor. Inner dim = `dim * ff_mult`. Try 2 (smaller/faster) or 8 (larger). With GLU, effective expansion is `ff_mult * 2/3`. | |
-| `ff_no_bias` | bool | False | Remove bias from feedforward layers. Increases throughput, no accuracy loss. Trend started with PaLM. | [PaLM 2022](https://arxiv.org/abs/2204.02311) |
-| `ff_dropout` | float | 0.0 | Dropout in feedforward sublayer. | |
+| `UNET_DIM_MULTS` | Min `SEQ_LEN` divisor | Approx params (dim=64) | Notes |
+|------------------|-----------------------|------------------------|-------|
+| `(1, 2, 4)` | 4 | ~5M | Default (3 levels) |
+| `(1, 2, 4, 8)` | 8 | ~10M | Deeper, needs `SEQ_LEN >= 8` |
+| `(1, 2)` | 2 | ~2M | Shallow, fast |
 
 ---
 
-## Attention
+## Diffusion Process
 
-Parameters controlling the self-attention mechanism.
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `TIMESTEPS` | `1000` | Number of diffusion steps T during training. More = smoother noise schedule. Try 500 for faster per-step speed. |
+| `SAMPLING_TIMESTEPS` | `50` | Steps for DDIM sampling (generation only). Does NOT affect training speed. |
+| `OBJECTIVE` | `'pred_v'` | Training objective. See table below. |
+| `BETA_SCHEDULE` | `'cosine'` | Noise schedule. `'cosine'` (default) or `'linear'`. |
+| `DDIM_SAMPLING_ETA` | `0.` | DDIM stochasticity: 0=deterministic, 1=DDPM-equivalent. |
 
-### Core Attention
+### Objective Comparison
 
-| Parameter | Type | Default | Description | Paper |
-|-----------|------|---------|-------------|-------|
-| `attn_flash` | bool | False | Use PyTorch `scaled_dot_product_attention` (Flash Attention via SDP). Faster + less memory. **Always turn this on.** | [Dao et al. 2022](https://arxiv.org/abs/2205.14135) |
-| `attn_qk_norm` | bool | False | L2-normalize queries and keys (cosine similarity attention). Prevents overflow, removes numerical stability issues. Proven at 22B scale by Google Brain. | [Henry et al. 2020](https://arxiv.org/abs/2010.04245), [Dehghani et al. 2023](https://arxiv.org/abs/2302.05442) |
-| `attn_qk_norm_groups` | int | 1 | Number of groups for grouped QK normalization. Bounds similarity to `[-groups, groups]`. 8 or 16 recommended. | |
-| `attn_qk_norm_scale` | float | None | Fixed scale for cosine sim attention (e.g. 10). Alternative to groups. | |
-| `attn_qk_norm_dim_scale` | bool | False | Learned scale per feature dimension (as in Google Brain 22B paper). | |
-| `attn_dropout` | float | 0.0 | Dropout on attention weights. | |
+| Objective | Description | Best for |
+|-----------|-------------|----------|
+| `pred_noise` | Predict the noise ε added at step t (original DDPM) | Linear schedule, simple baseline |
+| `pred_x0` | Predict clean data x_0 directly | Can be unstable; try if pred_v underperforms |
+| `pred_v` | Predict velocity v = √ᾱ·ε − √(1-ᾱ)·x_0 | Cosine schedule, modern models (SD 2.x, Imagen-Video) |
 
-### Multi-Query / Grouped-Query Attention
+### Beta Schedule Comparison
 
-| Parameter | Type | Default | Description | Paper |
-|-----------|------|---------|-------------|-------|
-| `attn_one_kv_head` | bool | False | Multi-Query Attention: single KV head, multi-headed queries. Memory-efficient for inference. | [Shazeer 2019](https://arxiv.org/abs/1911.02150) |
-| `attn_kv_heads` | int | None | **Grouped-Query Attention (GQA)**: number of KV heads. E.g. `heads=8, attn_kv_heads=2` means 4 query heads share 1 KV head. Saves memory. | [Ainslie et al. 2023](https://arxiv.org/abs/2305.13245) |
-
-### Persistent Memory KV
-
-| Parameter | Type | Default | Description | Paper |
-|-----------|------|---------|-------------|-------|
-| `attn_num_mem_kv` | int | 0 | Number of learned persistent memory key/value pairs prepended to attention. "Keeping the feedforwards and adding memory key/values leads to even better performance." | [Sukhbaatar et al. 2019](https://arxiv.org/abs/1907.01470) |
-
-### Sparse Attention
-
-| Parameter | Type | Default | Description | Paper |
-|-----------|------|---------|-------------|-------|
-| `attn_sparse_topk` | int | None | Keep only top-k attention values before softmax. Paper recommends k=8. | [Zhao et al. 2019](https://arxiv.org/abs/1912.11637) |
-| `attn_sparse_topk_straight_through` | bool | False | Straight-through gradients for sparse topk. | |
-| `attn_hard` | bool | False | Extreme case: only propagate single argmax value. | |
-
-### Attention Variants
-
-| Parameter | Type | Default | Description | Paper |
-|-----------|------|---------|-------------|-------|
-| `attn_on_attn` | bool | False | Gate attention output with queries. Found to perform worse with concatenation, better without. | [Huang et al. 2019](https://arxiv.org/abs/1908.06954) |
-| `attn_gate_values` | bool | False | Gate aggregated values with input (AlphaFold2-style). Small but noticeable improvement. | [AlphaFold2](https://github.com/deepmind/alphafold) |
-| `attn_pre_talking_heads` | bool | False | Linear mixing across heads pre-softmax (Talking Heads). Extra memory/compute. | [Shazeer et al. 2020](https://arxiv.org/abs/2003.02436) |
-| `attn_post_talking_heads` | bool | False | Linear mixing across heads post-softmax. | |
-| `residual_attn` | bool | False | Residualize pre-attention scores across layers. Best with post-norm. Allows higher LR. | [He et al. 2020](https://arxiv.org/abs/2012.11747) |
+| Schedule | Description | When to use |
+|----------|-------------|-------------|
+| `'cosine'` | Gradual SNR decay, preserves structure longer | Default, better for short sequences |
+| `'linear'` | Aggressive noise increase | Works well with pred_noise objective |
 
 ---
 
-## Positional Encoding
+## Optimization
 
-How the model understands token ordering.
-
-| Parameter | Type | Default | Where | Description | Paper |
-|-----------|------|---------|-------|-------------|-------|
-| `rotary_pos_emb` | bool | False | Decoder | **RoPE (Rotary Positional Embeddings)**. Standard for modern transformers. Relative positions via rotations. "Highly recommend when working on ordered sequences." Used in PaLM, LLaMA, etc. | [Su et al. 2021](https://arxiv.org/abs/2104.09864) |
-| `rotary_xpos` | bool | False | Decoder | Modified RoPE for length extrapolation (adds ALiBi-like decay). | [Sun et al. 2022](https://arxiv.org/abs/2212.10554) |
-| `rotary_xpos_scale_base` | int | 512 | Decoder | Receptive field scale for rotary_xpos. | |
-| `rel_pos_bias` | bool | False | Decoder | T5-style learned relative position bias added to attention matrix. Cheap relative positional encoding. | [Raffel et al. 2020](https://arxiv.org/abs/1910.10683) |
-| `alibi_pos_bias` | bool | False | Decoder | ALiBi: static linear bias on attention. Length extrapolation. May hinder global attention. | [Press et al. 2021](https://ofir.io/train_short_test_long.pdf) |
-| `alibi_num_heads` | int | heads | Decoder | Only apply ALiBi to this many heads (others can attend far distances). | |
-| `dynamic_pos_bias` | bool | False | Decoder | Learned position bias that generalizes to longer sequences. First place in RNA folding competition. | [CrossFormer](https://arxiv.org/abs/2108.00154), [SwinV2](https://arxiv.org/abs/2111.09883) |
-| `dynamic_pos_bias_log_distance` | bool | False | Decoder | Use log distances for dynamic pos bias (linear is better for language). | |
-| `use_abs_pos_emb` | bool | True | TransformerWrapper | Absolute positional embeddings. Can be turned off when using RoPE/ALiBi. Causal models can learn positions implicitly. | [Haviv et al. 2022](https://arxiv.org/abs/2203.16634) |
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `LEARNING_RATE` | `1e-4` | Initial LR for AdamW. Diffusion models are sensitive: try 3e-4 (fast) or 5e-5 (conservative). |
+| `BATCH_SIZE` | `64` | Micro-batch size. Larger = more stable gradients but more VRAM. Try 32, 128. |
+| `GRADIENT_ACCUMULATE_EVERY` | `1` | Gradient accumulation steps. Effective batch = BATCH_SIZE × this. |
+| `WEIGHT_DECAY` | `1e-4` | AdamW weight decay. |
+| `GRAD_CLIP` | `1.0` | Gradient norm clipping. Diffusion models can have spiky gradients. |
 
 ---
 
-## Regularization & Dropout
+## LR Schedule
 
-| Parameter | Type | Default | Where | Description |
-|-----------|------|---------|-------|-------------|
-| `layer_dropout` | float | 0.0 | Decoder | **Stochastic depth**: randomly drop entire layers during training. Needs careful tuning. |
-| `attn_dropout` | float | 0.0 | Decoder | Dropout on attention weights post-softmax. |
-| `ff_dropout` | float | 0.0 | Decoder | Dropout in feedforward block. |
-| `emb_dropout` | float | 0.0 | TransformerWrapper | Dropout after embedding layer. |
-
----
-
-## Residual Connections
-
-How sublayer outputs are added back to the residual stream.
-
-| Parameter | Type | Default | Description | Paper |
-|-----------|------|---------|-------------|-------|
-| `gate_residual` | bool | False | Gated residual connections. Shown to increase stability and performance in RL tasks. | [Parisotto et al. 2019](https://arxiv.org/abs/1910.06764) |
-| `scale_residual` | bool | False | Learned residual scaling (Normformer). Slight improvements but occasional instability. | [Normformer 2022](https://openreview.net/forum?id=GMYWzWztDx5) |
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `WARMUP_RATIO` | `0.05` | Fraction of budget for linear warmup. |
+| `WARMDOWN_RATIO` | `0.40` | Fraction of budget for cosine cooldown at end. |
+| `FINAL_LR_FRAC` | `0.1` | Final LR as fraction of initial (at end of cooldown). |
 
 ---
 
-## Memory & Recurrence
+## Memory Estimates (RTX 4090, BF16)
 
-For extending context or adding persistent learned memory.
+Rough peak VRAM for `SEQ_LEN=128`:
 
-| Parameter | Type | Default | Where | Description | Paper |
-|-----------|------|---------|-------|-------------|-------|
-| `num_memory_tokens` | int | 0 | TransformerWrapper | Learned tokens (like CLS) passed through all layers alongside input. Also known as "register tokens" — alleviates attention outliers. | [Burtsev 2020](https://arxiv.org/abs/2006.11527), [Darcet et al. 2023](https://arxiv.org/abs/2309.16588) |
-| `max_mem_len` | int | 0 | TransformerWrapper | Enable Transformer-XL recurrence with this memory length. Requires `rel_pos_bias=True` or `rotary_pos_emb=True`. | |
-| `shift_mem_down` | int | 0 | TransformerWrapper | Enhanced recurrence: route memory of layer N to layer N-1 on next step. | [Ding et al. 2021](https://arxiv.org/abs/2012.15688) |
+| Config | BATCH_SIZE | VRAM (est.) |
+|--------|-----------|-------------|
+| dim=64, mults=(1,2,4) | 64 | ~4 GB |
+| dim=128, mults=(1,2,4) | 32 | ~6 GB |
+| dim=64, mults=(1,2,4,8) | 32 | ~5 GB |
+| dim=64, mults=(1,2,4), SEQ_LEN=256 | 32 | ~5 GB |
 
----
-
-## Layer Structure
-
-Control the arrangement and sharing of attention/feedforward blocks.
-
-| Parameter | Type | Default | Description | Paper |
-|-----------|------|---------|-------------|-------|
-| `macaron` | bool | False | **Macaron configuration**: place attention between two half-step feedforward layers (FFN-Attn-FFN). Based on dynamical systems POV. Used in Conformer. | [Lu et al. 2019](https://arxiv.org/abs/1906.02762), [Conformer](https://arxiv.org/abs/2005.08100) |
-| `sandwich_coef` | int | None | Sandwich layer reordering: blocks of attention followed by blocks of feedforward. Optimal at 6. | [Press et al. 2020](https://arxiv.org/abs/1911.03864) |
-| `weight_tie_layers` | bool | False | Tie weights across all layers (ALBERT-style). Dramatically reduces parameters. | [Lan et al. 2019](https://arxiv.org/abs/1909.11942) |
-| `custom_layers` | tuple | None | Custom layer sequence, e.g. `('a', 'f', 'a', 'f')`. | |
-| `layers_execute_order` | tuple | None | Custom execution order of layers (0-indexed). Allows weight-sharing patterns. | |
-| `shift_tokens` | int/tuple | 0 | Shift a subset of feature dimensions by 1 token. Helps convergence for **character-level** training. May not help with BPE + RoPE. | [PENG Bo 2021](https://zhuanlan.zhihu.com/p/191393788) |
+Diffusion models generally need less VRAM than transformers per sample because there are
+no KV caches. The main bottleneck is the batch size and the Unet channel width.
 
 ---
 
-## TransformerWrapper-level Options
+## Key Differences from x-transformers LM
 
-These are set on the `TransformerWrapper` constructor (not `Decoder`).
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `num_tokens` | int | — | Vocabulary size. |
-| `max_seq_len` | int | — | Maximum sequence length. |
-| `use_abs_pos_emb` | bool | True | Whether to use absolute positional embeddings. |
-| `l2norm_embed` | bool | False | L2-normalize embeddings + small init (fixnorm). Improves convergence. |
-| `post_emb_norm` | bool | False | LayerNorm right after embeddings (BLOOM/YaLM-style). Use either this or `l2norm_embed`, not both. |
-| `emb_dropout` | float | 0.0 | Dropout after embedding. |
-| `num_memory_tokens` | int | 0 | Number of learned memory/register tokens. |
-| `max_mem_len` | int | 0 | Transformer-XL memory length. |
-| `shift_mem_down` | int | 0 | Enhanced recurrence shift. |
+| Property | x-transformers (AR LM) | x-DDPM (diffusion) |
+|----------|----------------------|---------------------|
+| Data | Discrete tokens | Continuous embeddings |
+| Forward pass | Autoregressive (causal) | U-Net denoising at random timestep t |
+| Loss | Cross-entropy | MSE (denoising) |
+| Metric | val_bpc (bits/char) | val_loss (MSE) |
+| Generation | Token-by-token | Iterative denoising (50-1000 steps) |
+| Optimizer | MuonAdamAtan2 (Muon for linear) | AdamW (Conv layers, no Muon advantage) |
+| Batch size | 24 (large context) | 64 (short context, no KV cache) |
 
 ---
 
-## AutoregressiveWrapper Options
+## Experiment Ideas (Ordered by Expected Impact)
 
-These are set on the `AutoregressiveWrapper` wrapping the model.
+### Quick Wins
+1. Tune `LEARNING_RATE`: try `3e-4`, `5e-5`
+2. Increase `BATCH_SIZE` to `128` if VRAM allows
+3. Try `UNET_DIM=128` with `BATCH_SIZE=32`
+4. Enable `self_condition=True` in Unet1D
 
-| Parameter | Type | Default | Description | Paper |
-|-----------|------|---------|-------------|-------|
-| `mask_prob` | float | 0.0 | **Forgetful Causal Masking**: randomly mask tokens during autoregressive training (like combining MLM with AR). Paper uses 0.15. Significantly better zero-shot performance. | [Liu et al. 2022](https://arxiv.org/abs/2210.13432) |
+### Architecture
+5. Try `UNET_DIM_MULTS=(1, 2, 4, 8)` with `SEQ_LEN=128`
+6. Try `EMB_DIM=64` with adjusted `UNET_DIM`
+7. Try `SEQ_LEN=256` with `BATCH_SIZE=32`
 
----
+### Diffusion
+8. Try `OBJECTIVE='pred_noise'` (compare to pred_v)
+9. Try `TIMESTEPS=500` (more steps per time budget)
+10. Try `BETA_SCHEDULE='linear'` with `pred_noise`
 
-## Recommended Combinations
-
-Based on the x-transformers README and common practice in modern LLMs:
-
-### Baseline (modern defaults)
-```python
-Decoder(
-    dim=512, depth=6, heads=8,
-    rotary_pos_emb=True,
-    attn_flash=True,
-    attn_qk_norm=True,
-    use_rmsnorm=True,
-    ff_relu_squared=True,
-)
-```
-
-### SwiGLU (PaLM/LLaMA-style)
-```python
-Decoder(
-    dim=512, depth=6, heads=8,
-    rotary_pos_emb=True,
-    attn_flash=True,
-    attn_qk_norm=True,
-    use_rmsnorm=True,
-    ff_glu=True,        # enable gating
-    ff_swish=True,       # Swish activation
-    ff_no_bias=True,     # no bias (PaLM style)
-)
-```
-
-### Memory-efficient (GQA)
-```python
-Decoder(
-    dim=768, depth=8, heads=12,
-    attn_kv_heads=4,     # grouped-query attention
-    rotary_pos_emb=True,
-    attn_flash=True,
-    attn_qk_norm=True,
-    use_rmsnorm=True,
-    ff_glu=True,
-    ff_swish=True,
-)
-```
-
-### Kitchen sink (many features)
-```python
-Decoder(
-    dim=640, depth=8, heads=10,
-    rotary_pos_emb=True,
-    attn_flash=True,
-    attn_qk_norm=True,
-    use_rmsnorm=True,
-    ff_glu=True,
-    ff_swish=True,
-    macaron=True,            # sandwich FFN
-    attn_num_mem_kv=16,      # persistent memory
-    shift_tokens=1,          # good for char-level
-    sandwich_norm=True,      # extra stability
-)
-```
-
----
-
-## Model Sizing Guide
-
-Phil Wang's guideline: **1:5 model-to-data ratio** (tokens seen = 5 x params).
-
-For a **5-minute training budget**, token throughput depends on your GPU. Rough estimates:
-
-| Params | dim | depth | heads | Tokens needed (5x) | Notes |
-|--------|-----|-------|-------|--------------------:|-------|
-| ~5M | 256 | 6 | 4 | 25M | Very small, fast iteration |
-| ~19M | 512 | 6 | 8 | 95M | Good starting point for 6-8 GB VRAM |
-| ~57M | 768 | 8 | 12 | 285M | Needs 12+ GB VRAM, fewer tokens in 5 min |
-| ~64M | 640 | 12 | 10 | 320M | Deeper, narrower variant |
-
-**Rule of thumb:** Larger models see fewer tokens in the same time. There's a sweet
-spot between model capacity and training tokens that depends on your specific GPU.
-Start small (19M params), establish a baseline, then try scaling up.
-
-**VRAM usage** is primarily driven by `dim`, `depth`, `batch_size`, and `max_seq_len`.
-Using `attn_kv_heads` (GQA) can significantly reduce attention memory for larger models.
+### Advanced
+11. Try `learned_sinusoidal_cond=True` for timestep embedding
+12. Try `random_fourier_features=True`
+13. Add `dropout=0.1` to ResNet blocks
